@@ -65,7 +65,9 @@ function ckey(h) {
   if (p.length >= 3 && p[p.length - 1].length === 2 && /^(co|com|ne|or|go|ac|ad|ed|gr|lg|org|net|gov|edu)$/.test(p[p.length - 2])) n = 3;
   return p.slice(-n).join(".");
 }
-const CK = (h) => "__px_" + ckey(h) + "__";
+// Cookie の保存名: Domain 属性付き → 登録ドメイン単位で共有 / Domain 無し(host-only) → ホスト単位で分離
+const CK_SHARED = (h) => "__pxd_" + ckey(h) + "__";
+const CK_HOST = (h) => "__pxh_" + String(h).toLowerCase() + "__";
 
 // ───────────────────────── URL変換 ─────────────────────────
 function toProxy(href, myOrigin) {
@@ -274,7 +276,8 @@ function rewriteSetCookie(line, host, secureProxy) {
   const parts = line.split(";").map((s) => s.trim());
   const nv = parts.shift();
   if (!nv || !nv.includes("=")) return null;
-  const out = [CK(host) + nv];
+  const hasDomain = parts.some((a) => a.split("=")[0].trim().toLowerCase() === "domain");
+  const out = [(hasDomain ? CK_SHARED(host) : CK_HOST(host)) + nv];
   for (const a of parts) {
     const k = a.split("=")[0].toLowerCase();
     if (["domain", "path", "secure", "samesite", "partitioned"].includes(k)) continue;
@@ -286,11 +289,14 @@ function rewriteSetCookie(line, host, secureProxy) {
   return out.join("; ");
 }
 function cookieFor(req, hostname) {
-  const ck = CK(hostname);
+  const prefixes = [CK_SHARED(hostname), CK_HOST(hostname)];
   return (req.headers.cookie || "")
     .split(/;\s*/)
-    .filter((c) => c.startsWith(ck))
-    .map((c) => c.slice(ck.length))
+    .map((c) => {
+      const p = prefixes.find((x) => c.startsWith(x));
+      return p ? c.slice(p.length) : null;
+    })
+    .filter(Boolean)
     .join("; ");
 }
 
@@ -527,6 +533,10 @@ async function handle(req, res) {
 
   const body = await readBody(req);
   const headers = buildUpstreamHeaders(req, upstream, myOrigin);
+  if (process.env.DEBUG === "1") {
+    const names = (headers.get("cookie") || "").split(";").map((c) => c.split("=")[0].trim()).filter(Boolean);
+    console.log("[dbg]", req.method, req.url, "->", upstream.origin + upstream.pathname, "cookies:", names.join(","));
+  }
   if (isDocReq) {
     headers.delete("if-none-match");
     headers.delete("if-modified-since");
@@ -726,18 +736,24 @@ function wsu(u){
 }
 var sa=Element.prototype.setAttribute;
 
-function ck(){return "__px_"+ckey(realBase().hostname)+"__"}
+function prefixesNow(){var h=realBase().hostname;return ["__pxd_"+ckey(h)+"__","__pxh_"+h.toLowerCase()+"__"]}
 try{
   if(!cd)cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie");
   Object.defineProperty(Document.prototype,"cookie",{configurable:true,enumerable:cd.enumerable,
     get:function(){
-      var p=ck();
-      return cd.get.call(this).split(/;\s*/).filter(function(c){return c.indexOf(p)===0}).map(function(c){return c.slice(p.length)}).join("; ");
+      var ps=prefixesNow();
+      return cd.get.call(this).split(/;\s*/).map(function(c){
+        for(var i=0;i<ps.length;i++){if(c.indexOf(ps[i])===0)return c.slice(ps[i].length)}
+        return null;
+      }).filter(function(c){return c!==null&&c!==""}).join("; ");
     },
     set:function(v){
       var parts=String(v).split(";"),nv=parts.shift().trim();
+      var hasDomain=parts.some(function(a){return a.split("=")[0].trim().toLowerCase()==="domain"});
       var rest=parts.map(function(a){return a.trim()}).filter(function(a){var k=a.split("=")[0].toLowerCase();return a&&k!=="domain"&&k!=="path"&&k!=="samesite"&&k!=="partitioned"});
-      cd.set.call(this,[ck()+nv].concat(rest).concat(["path=/"]).join("; "));
+      var h=realBase().hostname;
+      var pre=hasDomain?"__pxd_"+ckey(h)+"__":"__pxh_"+h.toLowerCase()+"__";
+      cd.set.call(this,[pre+nv].concat(rest).concat(["path=/"]).join("; "));
     }});
 }catch(e){}
 
