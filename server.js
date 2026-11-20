@@ -110,15 +110,20 @@ function hostCookieValue(req) {
 }
 
 function currentOrigin(req, myOrigin) {
+  let ownRef = false;
   if (req.headers.referer) {
     try {
       const r = new URL(req.headers.referer);
       if (r.origin === myOrigin) {
+        ownRef = true;
         const real = realFromProxyUrl(req.headers.referer, myOrigin);
         if (real && real.origin !== BASE.origin) return real.origin;
       }
     } catch {}
   }
+  // 外部サイト（OAuth の認可リダイレクト等）や直打ちからのページ遷移は、
+  // 直前に見た別サブドメインのCookieを使わず、入口ホストから始める
+  if (req.headers["sec-fetch-mode"] === "navigate" && !ownRef) return BASE.origin;
   const hc = hostCookieValue(req);
   return hc ? "https://" + hc : BASE.origin;
 }
