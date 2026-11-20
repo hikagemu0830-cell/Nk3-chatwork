@@ -1,73 +1,55 @@
 // server.js — Render等で動くNode.js版 中継(リバース)プロキシ
 // 要件: Node.js 20+ / package.json に "type": "module"
-// 任意(高速化): npm i undici  → 接続プール + HTTP/2 で上流取得が速くなる（無くても動く）
 //
 // 構成（通信を丸ごとProxy経由にする3層）
-//  1) サーバー側 : HTML/CSSのURLを全部書き換え（外部サイトは /~p/<host>/<path> 経由、httpsは省略表記）
+//  1) サーバー側 : HTML/CSSのURLを全部書き換え（外部サイトは /~p/<scheme>/<host>/<path> 経由）
 //  2) ブラウザ側 : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie などをProxy化
 //  3) ServiceWorker: /~sw.js がページから出る全リクエストを最終的にProxyへ回収
+// 従来どおり、TARGET のサイトは「ルート直下」でそのまま中継されます（互換維持）。
 //
 // 環境変数
-//  TARGET            中継の主対象（既定 https://www.chatwork.com/）
+//  TARGET            中継の主対象（既定 https://www.b-ch.com）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
 //  HEADER_TIMEOUT_MS 上流のヘッダ待ち上限（既定 25000）
 //  BODY_TIMEOUT_MS   HTML/CSS本文の受信上限（既定 60000）
-//  CACHE_MB          静的ファイルのメモリキャッシュ上限（既定 64）
 
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
-import zlib from "node:zlib";
 import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import { Readable, pipeline } from "node:stream";
 
-const TARGET = process.env.TARGET || "https://www.chatwork.com/";
+const TARGET = process.env.TARGET || "https://chatwork.com/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
 const HEADER_TIMEOUT = Number(process.env.HEADER_TIMEOUT_MS) || 25000;
 const BODY_TIMEOUT = Number(process.env.BODY_TIMEOUT_MS) || 60000;
-const CACHE_MAX = (Number(process.env.CACHE_MB) || 64) * 1024 * 1024;
-const CACHE_ITEM_MAX = 1.5 * 1024 * 1024;
 const MAX_REWRITE_BYTES = 20 * 1024 * 1024;
 const MAX_BODY_BYTES = 100 * 1024 * 1024;
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 const BASE = new URL(TARGET);
-const ROOT = ckey(BASE.hostname); // 登録可能ドメイン（例: chatwork.com）。配下のどのサブドメインも「自サイト」として扱う
-const isSiteHost = (h) => ckey(h) === ROOT;
-const HOST_CK = "__pxhost__"; // 現在の実ホスト（サブドメイン）をブラウザ側に覚えさせる内部Cookie
-const P = "/~p/"; // 外部サイト用: /~p/host/path （httpsは省略、httpの時だけ /~p/http/host/path）
+const BARE = BASE.hostname.replace(/^www\./i, "");
+const SITE_HOSTS = [BARE, "www." + BARE];
+const isSiteHost = (h) => SITE_HOSTS.includes(String(h).toLowerCase());
+const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ───────────────────────── 高速化: undici があれば接続プール+HTTP/2 ─────────────────────────
-let dispatcher;
-try {
-  const { Agent } = await import("undici");
-  dispatcher = new Agent({
-    connections: 64,
-    keepAliveTimeout: 30000,
-    keepAliveMaxTimeout: 600000,
-    allowH2: true,
-    bodyTimeout: 0,
-  });
-} catch {}
-
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
+// 1つのProxyドメインに複数サイトのcookieが混ざらないよう、サイトごとに接頭辞を付ける
 function ckey(h) {
   var p = String(h).toLowerCase().split(".");
   var n = 2;
   if (p.length >= 3 && p[p.length - 1].length === 2 && /^(co|com|ne|or|go|ac|ad|ed|gr|lg|org|net|gov|edu)$/.test(p[p.length - 2])) n = 3;
   return p.slice(-n).join(".");
 }
-// Cookie の保存名: Domain 属性付き → 登録ドメイン単位で共有 / Domain 無し(host-only) → ホスト単位で分離
-const CK_SHARED = (h) => "__pxd_" + ckey(h) + "__";
-const CK_HOST = (h) => "__pxh_" + String(h).toLowerCase() + "__";
+const CK = (h) => "__px_" + ckey(h) + "__";
 
 // ───────────────────────── URL変換 ─────────────────────────
 function toProxy(href, myOrigin) {
@@ -75,19 +57,16 @@ function toProxy(href, myOrigin) {
   try { u = new URL(href); } catch { return href; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return href;
   if (isSiteHost(u.hostname)) return myOrigin + u.pathname + u.search + u.hash;
-  const schemeSeg = u.protocol === "https:" ? "" : "http/";
-  return myOrigin + P + schemeSeg + u.host + u.pathname + u.search + u.hash;
+  return myOrigin + P + u.protocol.slice(0, -1) + "/" + u.host + u.pathname + u.search + u.hash;
 }
 
 function parseProxyPath(pathname) {
   if (!pathname.startsWith(P)) return null;
-  const rest = pathname.slice(P.length);
-  const m = /^(https?)\/([^/]+)(\/.*)?$/.exec(rest);
-  if (m) return { origin: m[1] + "://" + m[2], path: m[3] || "/" };
-  const m2 = /^([^/]+)(\/.*)?$/.exec(rest);
-  return m2 ? { origin: "https://" + m2[1], path: m2[2] || "/" } : null;
+  const m = /^(https?)\/([^/]+)(\/.*)?$/.exec(pathname.slice(P.length));
+  return m ? { origin: m[1] + "://" + m[2], path: m[3] || "/" } : null;
 }
 
+// Proxy上のURL → 本当のURL
 function realFromProxyUrl(str, myOrigin) {
   try {
     const u = new URL(str);
@@ -100,43 +79,25 @@ function realFromProxyUrl(str, myOrigin) {
   }
 }
 
-function hostCookieValue(req) {
-  const m = new RegExp("(?:^|;\\s*)" + HOST_CK + "=([^;]+)").exec(req.headers.cookie || "");
-  if (!m) return null;
-  try {
-    const h = decodeURIComponent(m[1]);
-    return isSiteHost(h) ? h : null;
-  } catch {
-    return null;
-  }
-}
-
-function currentOrigin(req, myOrigin) {
-  let ownRef = false;
+// このリクエストが最終的に取りに行く上流URLを決める
+function resolveUpstream(req, url, myOrigin) {
+  const p = parseProxyPath(url.pathname);
+  if (p) return new URL(p.origin + p.path + url.search);
+  // /~p/ でないルート相対パス: Refererが外部サイトのProxyページならそのサイトへ、なければTARGETへ
+  let origin = BASE.origin;
   if (req.headers.referer) {
     try {
       const r = new URL(req.headers.referer);
       if (r.origin === myOrigin) {
-        ownRef = true;
         const real = realFromProxyUrl(req.headers.referer, myOrigin);
-        if (real && real.origin !== BASE.origin) return real.origin;
+        if (real) origin = real.origin;
       }
     } catch {}
   }
-  // 外部サイト（OAuth の認可リダイレクト等）や直打ちからのページ遷移は、
-  // 直前に見た別サブドメインのCookieを使わず、入口ホストから始める
-  if (req.headers["sec-fetch-mode"] === "navigate" && !ownRef) return BASE.origin;
-  const hc = hostCookieValue(req);
-  return hc ? "https://" + hc : BASE.origin;
+  return new URL(origin + url.pathname + url.search);
 }
 
-function resolveUpstream(req, url, myOrigin) {
-  const p = parseProxyPath(url.pathname);
-  if (p) return new URL(p.origin + p.path + url.search);
-  return new URL(currentOrigin(req, myOrigin) + url.pathname + url.search);
-}
-
-// ───────────────────────── SSRF対策（DNS結果は10分キャッシュ・同時問い合わせも共有） ─────────────────────────
+// ───────────────────────── SSRF対策（社内/ローカル宛を拒否） ─────────────────────────
 const dnsCache = new Map();
 function privateIp(ip) {
   if (net.isIPv4(ip)) {
@@ -152,17 +113,17 @@ async function assertPublic(hostname) {
   if (isSiteHost(h)) return;
   if (!ALLOW_EXTERNAL) throw httpErr(403, "このサーバーはTARGET以外への中継を許可していません");
   if (/^(localhost|.*\.localhost|.*\.local|.*\.internal)$/.test(h)) throw httpErr(403, "blocked host");
-  let c = dnsCache.get(h);
-  if (!c || c.exp < Date.now()) {
-    const p = net.isIP(h)
-      ? Promise.resolve(privateIp(h))
-      : dns.lookup(h, { all: true }).then((a) => a.some((x) => privateIp(x.address)));
-    c = { p, exp: Date.now() + 10 * 60 * 1000 };
-    if (dnsCache.size > 2000) dnsCache.clear();
-    dnsCache.set(h, c);
-    p.catch(() => dnsCache.delete(h));
+  const c = dnsCache.get(h);
+  if (c && c.exp > Date.now()) {
+    if (c.bad) throw httpErr(403, "blocked host");
+    return;
   }
-  if (await c.p) throw httpErr(403, "blocked host");
+  let bad;
+  if (net.isIP(h)) bad = privateIp(h);
+  else bad = (await dns.lookup(h, { all: true })).some((x) => privateIp(x.address));
+  if (dnsCache.size > 2000) dnsCache.clear();
+  dnsCache.set(h, { bad, exp: Date.now() + 60000 });
+  if (bad) throw httpErr(403, "blocked host");
 }
 function httpErr(status, message) {
   const e = new Error(message);
@@ -177,8 +138,7 @@ function rewriteUrl(v, base, my) {
   const s = v.trim();
   if (!s || SKIP_RE.test(s) || s.startsWith(my + P)) return v;
   try {
-    const u = new URL(s, base);
-    return toProxy(u.href, my).replace(/"/g, "%22").replace(/'/g, "%27");
+    return toProxy(new URL(s, base).href, my).replace(/"/g, "%22").replace(/'/g, "%27");
   } catch {
     return v;
   }
@@ -250,6 +210,7 @@ function rewriteHtml(html, upstream, my) {
     return rewriteTag(tname, tattrs, base, my);
   });
 
+  // 断片(HTMLの一部だけ返すAPI)にはshimを入れない
   if (/<(html|head|body|!doctype)/i.test(out.slice(0, 4096))) {
     const shim = `<script src="/~shim.js?v=${SHIM_VER}"></script>`;
     if (/<head[\s>]/i.test(out)) out = out.replace(/<head(\s[^>]*)?>/i, (m) => m + shim);
@@ -259,6 +220,7 @@ function rewriteHtml(html, upstream, my) {
   return out;
 }
 
+// 文字コード（Shift_JIS / EUC-JP 等）を判定してUTF-8に統一
 function charsetOf(type, buf) {
   let m = /charset\s*=\s*["']?([\w.:-]+)/i.exec(type || "");
   if (!m) {
@@ -276,8 +238,7 @@ function rewriteSetCookie(line, host, secureProxy) {
   const parts = line.split(";").map((s) => s.trim());
   const nv = parts.shift();
   if (!nv || !nv.includes("=")) return null;
-  const hasDomain = parts.some((a) => a.split("=")[0].trim().toLowerCase() === "domain");
-  const out = [(hasDomain ? CK_SHARED(host) : CK_HOST(host)) + nv];
+  const out = [CK(host) + nv];
   for (const a of parts) {
     const k = a.split("=")[0].toLowerCase();
     if (["domain", "path", "secure", "samesite", "partitioned"].includes(k)) continue;
@@ -289,14 +250,11 @@ function rewriteSetCookie(line, host, secureProxy) {
   return out.join("; ");
 }
 function cookieFor(req, hostname) {
-  const prefixes = [CK_SHARED(hostname), CK_HOST(hostname)];
+  const ck = CK(hostname);
   return (req.headers.cookie || "")
     .split(/;\s*/)
-    .map((c) => {
-      const p = prefixes.find((x) => c.startsWith(x));
-      return p ? c.slice(p.length) : null;
-    })
-    .filter(Boolean)
+    .filter((c) => c.startsWith(ck))
+    .map((c) => c.slice(ck.length))
     .join("; ");
 }
 
@@ -322,6 +280,7 @@ function buildUpstreamHeaders(req, upstream, myOrigin) {
   return h;
 }
 
+// ★修正1: DROP_RES から "location" を削除
 const DROP_RES = new Set(["content-security-policy", "content-security-policy-report-only", "x-frame-options", "strict-transport-security", "public-key-pins", "report-to", "nel", "cross-origin-embedder-policy", "cross-origin-opener-policy", "cross-origin-resource-policy", "permissions-policy", "alt-svc", "link", "set-cookie", "content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive", "refresh", "content-location", "clear-site-data"]);
 
 function corsHeaders(req) {
@@ -337,10 +296,12 @@ function corsHeaders(req) {
   };
 }
 
+// ★修正2: GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
   for (const [k, v] of r.headers) {
     if (DROP_RES.has(k) || k.startsWith("access-control-")) continue;
+    
     if (k === "location" || k === "x-pjax-url" || k === "turbo-location") {
       try {
         h[k] = toProxy(new URL(v, upstream).href, myOrigin);
@@ -349,6 +310,7 @@ function responseHeaders(r, req, upstream, myOrigin) {
       }
       continue;
     }
+    
     h[k] = v;
   }
   Object.assign(h, corsHeaders(req));
@@ -356,67 +318,6 @@ function responseHeaders(r, req, upstream, myOrigin) {
   const cookies = sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
   if (cookies.length) h["set-cookie"] = cookies;
   return h;
-}
-
-// ───────────────────────── 圧縮（HTML/CSS/JS/JSONをbr/gzipで返して転送を軽く） ─────────────────────────
-const COMPRESSIBLE = /^(text\/(?!event-stream)|application\/(javascript|x-javascript|json|manifest\+json|xml|xhtml\+xml|rss\+xml|atom\+xml)|image\/svg\+xml)/i;
-function pickEnc(req) {
-  const a = String(req.headers["accept-encoding"] || "");
-  if (/\bbr\b/.test(a)) return "br";
-  if (/\bgzip\b/.test(a)) return "gzip";
-  return null;
-}
-function compressBuf(buf, enc) {
-  return new Promise((ok, ng) => {
-    const cb = (e, r) => (e ? ng(e) : ok(r));
-    if (enc === "br")
-      zlib.brotliCompress(buf, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: buf.length } }, cb);
-    else zlib.gzip(buf, { level: 5 }, cb);
-  });
-}
-async function sendBuf(req, res, status, hdrs, buf, type) {
-  hdrs["vary"] = "Origin, Accept-Encoding";
-  const enc = pickEnc(req);
-  if (enc && buf.length > 1024 && COMPRESSIBLE.test(type || "") && !hdrs["content-encoding"]) {
-    try {
-      buf = await compressBuf(buf, enc);
-      hdrs["content-encoding"] = enc;
-    } catch {}
-  }
-  hdrs["content-length"] = buf.length;
-  res.writeHead(status, hdrs);
-  res.end(buf);
-}
-
-// ───────────────────────── 静的ファイルのメモリキャッシュ ─────────────────────────
-const CACHE = new Map();
-let cacheBytes = 0;
-const STATIC_RE = /^(application\/(javascript|x-javascript|font|x-font)|text\/(javascript|css)|image\/|font\/|application\/vnd\.ms-fontobject)/i;
-function cacheTtl(cc) {
-  if (!cc || /no-store|no-cache|private/i.test(cc)) return 0;
-  const m = /(?:s-maxage|max-age)=(\d+)/i.exec(cc);
-  return m ? Math.min(Number(m[1]), 3600) * 1000 : 0;
-}
-function cachePut(k, v) {
-  if (CACHE.has(k)) {
-    cacheBytes -= CACHE.get(k).buf.length;
-    CACHE.delete(k);
-  }
-  CACHE.set(k, v);
-  cacheBytes += v.buf.length;
-  for (const [kk, vv] of CACHE) {
-    if (cacheBytes <= CACHE_MAX) break;
-    cacheBytes -= vv.buf.length;
-    CACHE.delete(kk);
-  }
-}
-function cacheStore(key, status, hdrs, buf, type, ttl) {
-  const h = {};
-  for (const [k, v] of Object.entries(hdrs)) {
-    if (k.startsWith("access-control-") || k === "vary" || k === "content-length" || k === "content-encoding" || k === "set-cookie") continue;
-    h[k] = v;
-  }
-  cachePut(key, { status, hdrs: h, buf, type, exp: Date.now() + ttl });
 }
 
 // ───────────────────────── 上流への取得（再試行・タイムアウト付き） ─────────────────────────
@@ -429,12 +330,12 @@ async function fetchUpstream(upstream, init, canRetry, res) {
     res.once("close", onClose);
     const timer = setTimeout(() => ac.abort(new Error("upstream timeout")), HEADER_TIMEOUT);
     try {
-      const r = await fetch(upstream, { ...init, signal: ac.signal, redirect: "manual", ...(dispatcher ? { dispatcher } : {}) });
+      const r = await fetch(upstream, { ...init, signal: ac.signal, redirect: "manual" });
       clearTimeout(timer);
       if (canRetry && [502, 503, 504].includes(r.status) && i < tries) {
         res.off("close", onClose);
         r.body?.cancel().catch(() => {});
-        await sleep(150 * (i + 1));
+        await sleep(300 * (i + 1));
         continue;
       }
       return { r, ac };
@@ -443,7 +344,7 @@ async function fetchUpstream(upstream, init, canRetry, res) {
       res.off("close", onClose);
       lastErr = e;
       if (res.destroyed) throw e;
-      await sleep(150 * (i + 1));
+      await sleep(300 * (i + 1));
     }
   }
   throw lastErr;
@@ -490,14 +391,16 @@ async function handle(req, res) {
   const proto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
   const host = String(req.headers["x-forwarded-host"] || req.headers.host || "localhost").split(",")[0].trim();
   const myOrigin = `${proto}://${host}`;
-  const url = new URL("http://local" + req.url);
+  const url = new URL("http://local" + req.url); // "//x" をホストと誤解釈させない
 
+  // 内部エンドポイント
   if (url.pathname === "/~health") {
     res.writeHead(200, { "content-type": "text/plain" });
     return res.end("ok");
   }
   if (url.pathname === "/~shim.js") {
-    return sendBuf(req, res, 200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=86400" }, Buffer.from(SHIM_JS), "application/javascript");
+    res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=3600" });
+    return res.end(SHIM_JS);
   }
   if (url.pathname === "/~sw.js") {
     res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "no-cache", "service-worker-allowed": "/" });
@@ -509,34 +412,13 @@ async function handle(req, res) {
   }
 
   const upstream = resolveUpstream(req, url, myOrigin);
-  const isDocReq = /text\/html/i.test(req.headers.accept || "");
-
   if (upstream.hostname.toLowerCase() === host.replace(/:\d+$/, "").toLowerCase() && !isSiteHost(upstream.hostname))
     throw httpErr(508, "Loop detected");
-
-  // キャッシュヒット（静的ファイルのみ）
-  const cacheable = req.method === "GET" && !req.headers.range && !isDocReq;
-  const ckeyStr = myOrigin + "|" + upstream.href;
-  if (cacheable) {
-    const c = CACHE.get(ckeyStr);
-    if (c) {
-      if (c.exp > Date.now()) {
-        const h = { ...c.hdrs, ...corsHeaders(req) };
-        return sendBuf(req, res, c.status, h, c.buf, c.type);
-      }
-      cacheBytes -= c.buf.length;
-      CACHE.delete(ckeyStr);
-    }
-  }
-
   await assertPublic(upstream.hostname);
 
   const body = await readBody(req);
   const headers = buildUpstreamHeaders(req, upstream, myOrigin);
-  if (process.env.DEBUG === "1") {
-    const names = (headers.get("cookie") || "").split(";").map((c) => c.split("=")[0].trim()).filter(Boolean);
-    console.log("[dbg]", req.method, req.url, "->", upstream.origin + upstream.pathname, "cookies:", names.join(","));
-  }
+  const isDocReq = /text\/html/i.test(req.headers.accept || "");
   if (isDocReq) {
     headers.delete("if-none-match");
     headers.delete("if-modified-since");
@@ -546,6 +428,7 @@ async function handle(req, res) {
   const status = r.status;
   const hdrs = responseHeaders(r, req, upstream, myOrigin);
 
+  // ★修正3: リダイレクト処理の簡略化
   if (hdrs["location"] && status >= 300 && status < 400) {
     r.body?.cancel().catch(() => {});
     hdrs["cache-control"] = "no-store";
@@ -567,9 +450,7 @@ async function handle(req, res) {
     return res.end();
   }
 
-  const ttl = cacheable && status === 200 && !hdrs["set-cookie"] && STATIC_RE.test(type) ? cacheTtl(r.headers.get("cache-control")) : 0;
-
-  // HTML / CSS: 書き換え
+  // HTML / CSS は読み込んで書き換え
   if ((isHtml || isCss) && !(Number(lenH) > MAX_REWRITE_BYTES)) {
     const timer = setTimeout(() => ac.abort(new Error("body timeout")), BODY_TIMEOUT);
     let buf;
@@ -580,46 +461,18 @@ async function handle(req, res) {
     }
     const text = decode(buf, charsetOf(type, buf));
     const out = Buffer.from(isHtml ? rewriteHtml(text, upstream, myOrigin) : rewriteCss(text, upstream.href, myOrigin), "utf8");
-    const ct = (isHtml ? "text/html" : "text/css") + "; charset=utf-8";
-    hdrs["content-type"] = ct;
+    hdrs["content-type"] = (isHtml ? "text/html" : "text/css") + "; charset=utf-8";
+    hdrs["content-length"] = out.length;
     if (isHtml) {
       hdrs["cache-control"] = "no-store";
       delete hdrs.etag;
       delete hdrs["last-modified"];
-      if (isSiteHost(upstream.hostname)) {
-        const hc = HOST_CK + "=" + encodeURIComponent(upstream.hostname) + "; Path=/; SameSite=Lax" + (myOrigin.startsWith("https") ? "; Secure" : "");
-        hdrs["set-cookie"] = (Array.isArray(hdrs["set-cookie"]) ? hdrs["set-cookie"] : hdrs["set-cookie"] ? [hdrs["set-cookie"]] : []).concat(hc);
-      }
-    } else if (ttl > 0) cacheStore(ckeyStr, status, hdrs, out, ct, ttl);
-    return sendBuf(req, res, status, hdrs, out, ct);
-  }
-
-  // 小さい静的ファイル: 読み切ってキャッシュ
-  if (ttl > 0 && lenH && Number(lenH) <= CACHE_ITEM_MAX) {
-    const timer = setTimeout(() => ac.abort(new Error("body timeout")), BODY_TIMEOUT);
-    let buf;
-    try {
-      buf = Buffer.from(await r.arrayBuffer());
-    } finally {
-      clearTimeout(timer);
     }
-    if (buf.length <= CACHE_ITEM_MAX * 4) cacheStore(ckeyStr, status, hdrs, buf, type, ttl);
-    return sendBuf(req, res, status, hdrs, buf, type);
+    res.writeHead(status, hdrs);
+    return res.end(out);
   }
 
-  // それ以外: ストリーム転送（テキスト系はその場で圧縮）
-  const encOut = status === 200 && !req.headers.range && COMPRESSIBLE.test(type) ? pickEnc(req) : null;
-  if (encOut) {
-    delete hdrs["content-length"];
-    hdrs["content-encoding"] = encOut;
-    hdrs["vary"] = "Origin, Accept-Encoding";
-    res.writeHead(status, hdrs);
-    const z = encOut === "br"
-      ? zlib.createBrotliCompress({ params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } })
-      : zlib.createGzip({ level: 5 });
-    pipeline(Readable.fromWeb(r.body), z, res, () => {});
-    return;
-  }
+  // それ以外（画像・動画・JS・JSON等）はストリーム転送（Range/206もそのまま）
   if (lenH && !enc) hdrs["content-length"] = lenH;
   res.writeHead(status, hdrs);
   pipeline(Readable.fromWeb(r.body), res, () => {});
@@ -672,35 +525,20 @@ function makeShim() {
   return String.raw`(function(){
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
-var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},ROOT=${JSON.stringify(ROOT)},HOSTCK=${JSON.stringify(HOST_CK)};
+var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},HOSTS=${JSON.stringify(SITE_HOSTS)};
 var ckey=${ckey.toString()};
-var cd=null;try{cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie")}catch(e){}
-function isSite(h){return ckey(h)===ROOT}
-function hostCk(){
-  try{
-    var raw=(cd&&cd.get)?cd.get.call(document):document.cookie;
-    var m=new RegExp("(?:^|;\\s*)"+HOSTCK+"=([^;]+)").exec(raw);
-    return m?decodeURIComponent(m[1]):null;
-  }catch(e){return null}
-}
+function isSite(h){return HOSTS.indexOf(String(h).toLowerCase())>=0}
 function parseP(pn){
   if(pn.indexOf(P)!==0)return null;
-  var rest=pn.slice(P.length);
-  var m=/^(https?)\/([^\/]+)(\/.*)?$/.exec(rest);
-  if(m)return{origin:m[1]+"://"+m[2],path:m[3]||"/"};
-  var m2=/^([^\/]+)(\/.*)?$/.exec(rest);
-  return m2?{origin:"https://"+m2[1],path:m2[2]||"/"}:null;
+  var m=/^(https?)\/([^\/]+)(\/.*)?$/.exec(pn.slice(P.length));
+  return m?{origin:m[1]+"://"+m[2],path:m[3]||"/"}:null;
 }
 function realBase(){
-  try{
-    var p=parseP(location.pathname);
-    if(p)return new URL(p.origin+p.path+location.search);
-    var hc=hostCk(),h=(hc&&isSite(hc))?hc:new URL(T).hostname;
-    return new URL(location.protocol+"//"+h+location.pathname+location.search);
-  }catch(e){return new URL(T)}
+  try{var p=parseP(location.pathname);return p?new URL(p.origin+p.path+location.search):new URL(T+location.pathname+location.search)}
+  catch(e){return new URL(T)}
 }
 var SKIP=/^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|ws:|wss:)/i;
-// 先に「本当のURL」へ解決してからプロキシパスへ変換する
+// どんなURLでもProxy経由のURLへ（何度通しても結果は同じ）
 function prox(h){
   try{
     if(h==null)return h;
@@ -710,14 +548,12 @@ function prox(h){
     var u=new URL(t,location.href);
     if(u.protocol!=="http:"&&u.protocol!=="https:")return h;
     if(u.origin===O){
-      if(u.pathname.indexOf(P)===0)return u.href;
-      if(u.pathname.indexOf("/~")===0)return u.href;
+      if(u.pathname.indexOf(P)===0||u.pathname.indexOf("/~")===0)return u.href;
       var rb=realBase();
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
     if(isSite(u.hostname))return O+u.pathname+u.search+u.hash;
-    var schemeSeg=u.protocol==="https:"?"":"http/";
-    return O+P+schemeSeg+u.host+u.pathname+u.search+u.hash;
+    return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
   }catch(e){return h}
 }
 function wsu(u){
@@ -736,27 +572,23 @@ function wsu(u){
 }
 var sa=Element.prototype.setAttribute;
 
-function prefixesNow(){var h=realBase().hostname;return ["__pxd_"+ckey(h)+"__","__pxh_"+h.toLowerCase()+"__"]}
+// ── Cookie（サイトごとの名前空間に分離）
+function ck(){return "__px_"+ckey(realBase().hostname)+"__"}
 try{
-  if(!cd)cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie");
+  var cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie");
   Object.defineProperty(Document.prototype,"cookie",{configurable:true,enumerable:cd.enumerable,
     get:function(){
-      var ps=prefixesNow();
-      return cd.get.call(this).split(/;\s*/).map(function(c){
-        for(var i=0;i<ps.length;i++){if(c.indexOf(ps[i])===0)return c.slice(ps[i].length)}
-        return null;
-      }).filter(function(c){return c!==null&&c!==""}).join("; ");
+      var p=ck();
+      return cd.get.call(this).split(/;\s*/).filter(function(c){return c.indexOf(p)===0}).map(function(c){return c.slice(p.length)}).join("; ");
     },
     set:function(v){
       var parts=String(v).split(";"),nv=parts.shift().trim();
-      var hasDomain=parts.some(function(a){return a.split("=")[0].trim().toLowerCase()==="domain"});
       var rest=parts.map(function(a){return a.trim()}).filter(function(a){var k=a.split("=")[0].toLowerCase();return a&&k!=="domain"&&k!=="path"&&k!=="samesite"&&k!=="partitioned"});
-      var h=realBase().hostname;
-      var pre=hasDomain?"__pxd_"+ckey(h)+"__":"__pxh_"+h.toLowerCase()+"__";
-      cd.set.call(this,[pre+nv].concat(rest).concat(["path=/"]).join("; "));
+      cd.set.call(this,[ck()+nv].concat(rest).concat(["path=/"]).join("; "));
     }});
 }catch(e){}
 
+// ── fetch / XHR / beacon / SSE / WebSocket / Worker
 try{if(window.fetch){var f0=window.fetch;window.fetch=function(i,o){
   var n=i;
   try{if(typeof Request!=="undefined"&&i instanceof Request)n=new Request(prox(i.url),i);else n=prox(i)}catch(e){n=i}
@@ -770,6 +602,7 @@ function wrapCtor(name,fn){
 }
 wrapCtor("WebSocket",wsu);wrapCtor("EventSource",prox);wrapCtor("Worker",prox);wrapCtor("SharedWorker",prox);
 
+// ── 要素のURLプロパティ / setAttribute
 [["HTMLImageElement","src"],["HTMLScriptElement","src"],["HTMLLinkElement","href"],["HTMLAnchorElement","href"],["HTMLAreaElement","href"],["HTMLIFrameElement","src"],["HTMLSourceElement","src"],["HTMLMediaElement","src"],["HTMLTrackElement","src"],["HTMLEmbedElement","src"],["HTMLObjectElement","data"],["HTMLInputElement","src"],["HTMLFormElement","action"]].forEach(function(p){
   try{
     var proto=window[p[0]]&&window[p[0]].prototype;if(!proto)return;
@@ -786,6 +619,7 @@ Element.prototype.setAttribute=function(n,v){
   return sa.call(this,n,v);
 };
 
+// ── リンク/フォーム/履歴/window.open/Navigation API
 function fixLink(e){
   var a=e.target&&e.target.closest?e.target.closest("a[href],area[href]"):null;if(!a)return;
   var raw=a.getAttribute("href"),t=prox(raw);if(t!==raw)sa.call(a,"href",t);
@@ -814,24 +648,7 @@ try{
   }
 }catch(e){}
 
-// 動的に追加された iframe（YouTube IFrame API 等）の src も後から補正
-try{
-  new MutationObserver(function(ms){
-    for(var i=0;i<ms.length;i++){
-      var ns=ms[i].addedNodes;
-      for(var j=0;j<ns.length;j++){
-        var n=ns[j];
-        if(!n||n.nodeType!==1)continue;
-        var fr=n.tagName==="IFRAME"?[n]:(n.querySelectorAll?[].slice.call(n.querySelectorAll("iframe")):[]);
-        fr.forEach(function(f){
-          var raw=f.getAttribute("src");if(!raw)return;
-          var t=prox(raw);if(t!==raw)sa.call(f,"src",t);
-        });
-      }
-    }
-  }).observe(document,{childList:true,subtree:true});
-}catch(e){}
-
+// ── ServiceWorker: 自分のSWを登録し、サイト側のSW登録は無効化
 try{
   if(navigator.serviceWorker){
     var reg0=navigator.serviceWorker.register.bind(navigator.serviceWorker);
@@ -846,29 +663,24 @@ try{
 // ───────────────────────── ServiceWorker（最終的に全通信を回収） ─────────────────────────
 function makeSw() {
   return String.raw`"use strict";
-const P=${JSON.stringify(P)},ROOT=${JSON.stringify(ROOT)};
+const P=${JSON.stringify(P)},HOSTS=${JSON.stringify(SITE_HOSTS)};
 const O=self.location.origin;
-const ckey=${ckey.toString()};
-const isSite=(h)=>ckey(h)===ROOT;
+const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
 self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
 function toProxy(u){
   if(u.protocol!=="http:"&&u.protocol!=="https:")return null;
   if(isSite(u.hostname))return O+u.pathname+u.search;
-  const schemeSeg=u.protocol==="https:"?"":"http/";
-  return O+P+schemeSeg+u.host+u.pathname+u.search;
+  return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search;
 }
 async function clientReal(id){
   if(!id)return null;
   try{
     const c=await self.clients.get(id);if(!c)return null;
-    const u=new URL(c.url);if(u.origin!==O||u.pathname.indexOf(P)!==0)return null;
-    const rest=u.pathname.slice(P.length);
-    const m=/^(https?)\/([^\/]+)/.exec(rest);
-    if(m)return{scheme:m[1],host:m[2]};
-    const m2=/^([^\/]+)/.exec(rest);
-    return m2?{scheme:"https",host:m2[1]}:null;
+    const u=new URL(c.url);if(u.origin!==O)return null;
+    const m=/^\/~p\/(https?)\/([^\/]+)/.exec(u.pathname);
+    return m?{scheme:m[1],host:m[2]}:null;
   }catch(e){return null}
 }
 self.addEventListener("fetch",(e)=>{
@@ -911,7 +723,7 @@ const server = http.createServer((req, res) => {
     else res.destroy();
   });
 });
-server.keepAliveTimeout = 65000;
+server.keepAliveTimeout = 65000; // Renderのロードバランサより長く
 server.headersTimeout = 70000;
 server.requestTimeout = 0;
 server.on("upgrade", handleUpgrade);
@@ -924,4 +736,4 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 10000).unref();
 });
-server.listen(PORT, () => console.log(`relay listening on ${PORT} -> ${TARGET} (undici: ${dispatcher ? "on" : "off"})`));
+server.listen(PORT, () => console.log(`relay listening on ${PORT} -> ${TARGET}`));
