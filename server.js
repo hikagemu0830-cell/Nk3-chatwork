@@ -38,9 +38,9 @@ const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
 const BASE = new URL(TARGET);
-const BARE = BASE.hostname.replace(/^www\./i, "");
-const SITE_HOSTS = [BARE, "www." + BARE];
-const isSiteHost = (h) => SITE_HOSTS.includes(String(h).toLowerCase());
+const ROOT = ckey(BASE.hostname); // 登録可能ドメイン（例: chatwork.com）。配下のどのサブドメインも「自サイト」として扱う
+const isSiteHost = (h) => ckey(h) === ROOT;
+const HOST_CK = "__pxhost__"; // 現在の実ホスト（サブドメイン）をブラウザ側に覚えさせる内部Cookie
 const P = "/~p/"; // 外部サイト用: /~p/host/path （httpsは省略、httpの時だけ /~p/http/host/path）
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -98,20 +98,35 @@ function realFromProxyUrl(str, myOrigin) {
   }
 }
 
-function resolveUpstream(req, url, myOrigin) {
-  const p = parseProxyPath(url.pathname);
-  if (p) return new URL(p.origin + p.path + url.search);
-  let origin = BASE.origin;
+function hostCookieValue(req) {
+  const m = new RegExp("(?:^|;\\s*)" + HOST_CK + "=([^;]+)").exec(req.headers.cookie || "");
+  if (!m) return null;
+  try {
+    const h = decodeURIComponent(m[1]);
+    return isSiteHost(h) ? h : null;
+  } catch {
+    return null;
+  }
+}
+
+function currentOrigin(req, myOrigin) {
   if (req.headers.referer) {
     try {
       const r = new URL(req.headers.referer);
       if (r.origin === myOrigin) {
         const real = realFromProxyUrl(req.headers.referer, myOrigin);
-        if (real) origin = real.origin;
+        if (real && real.origin !== BASE.origin) return real.origin;
       }
     } catch {}
   }
-  return new URL(origin + url.pathname + url.search);
+  const hc = hostCookieValue(req);
+  return hc ? "https://" + hc : BASE.origin;
+}
+
+function resolveUpstream(req, url, myOrigin) {
+  const p = parseProxyPath(url.pathname);
+  if (p) return new URL(p.origin + p.path + url.search);
+  return new URL(currentOrigin(req, myOrigin) + url.pathname + url.search);
 }
 
 // ───────────────────────── SSRF対策（DNS結果は10分キャッシュ・同時問い合わせも共有） ─────────────────────────
@@ -556,6 +571,10 @@ async function handle(req, res) {
       hdrs["cache-control"] = "no-store";
       delete hdrs.etag;
       delete hdrs["last-modified"];
+      if (isSiteHost(upstream.hostname)) {
+        const hc = HOST_CK + "=" + encodeURIComponent(upstream.hostname) + "; Path=/; SameSite=Lax" + (myOrigin.startsWith("https") ? "; Secure" : "");
+        hdrs["set-cookie"] = (Array.isArray(hdrs["set-cookie"]) ? hdrs["set-cookie"] : hdrs["set-cookie"] ? [hdrs["set-cookie"]] : []).concat(hc);
+      }
     } else if (ttl > 0) cacheStore(ckeyStr, status, hdrs, out, ct, ttl);
     return sendBuf(req, res, status, hdrs, out, ct);
   }
@@ -638,9 +657,17 @@ function makeShim() {
   return String.raw`(function(){
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
-var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},ROOT=${JSON.stringify(ROOT)},HOSTCK=${JSON.stringify(HOST_CK)};
 var ckey=${ckey.toString()};
-function isSite(h){return HOSTS.indexOf(String(h).toLowerCase())>=0}
+var cd=null;try{cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie")}catch(e){}
+function isSite(h){return ckey(h)===ROOT}
+function hostCk(){
+  try{
+    var raw=(cd&&cd.get)?cd.get.call(document):document.cookie;
+    var m=new RegExp("(?:^|;\\s*)"+HOSTCK+"=([^;]+)").exec(raw);
+    return m?decodeURIComponent(m[1]):null;
+  }catch(e){return null}
+}
 function parseP(pn){
   if(pn.indexOf(P)!==0)return null;
   var rest=pn.slice(P.length);
@@ -650,8 +677,12 @@ function parseP(pn){
   return m2?{origin:"https://"+m2[1],path:m2[2]||"/"}:null;
 }
 function realBase(){
-  try{var p=parseP(location.pathname);return p?new URL(p.origin+p.path+location.search):new URL(T+location.pathname+location.search)}
-  catch(e){return new URL(T)}
+  try{
+    var p=parseP(location.pathname);
+    if(p)return new URL(p.origin+p.path+location.search);
+    var hc=hostCk(),h=(hc&&isSite(hc))?hc:new URL(T).hostname;
+    return new URL(location.protocol+"//"+h+location.pathname+location.search);
+  }catch(e){return new URL(T)}
 }
 var SKIP=/^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|ws:|wss:)/i;
 // 先に「本当のURL」へ解決してからプロキシパスへ変換する
@@ -692,7 +723,7 @@ var sa=Element.prototype.setAttribute;
 
 function ck(){return "__px_"+ckey(realBase().hostname)+"__"}
 try{
-  var cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie");
+  if(!cd)cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie");
   Object.defineProperty(Document.prototype,"cookie",{configurable:true,enumerable:cd.enumerable,
     get:function(){
       var p=ck();
@@ -794,9 +825,10 @@ try{
 // ───────────────────────── ServiceWorker（最終的に全通信を回収） ─────────────────────────
 function makeSw() {
   return String.raw`"use strict";
-const P=${JSON.stringify(P)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+const P=${JSON.stringify(P)},ROOT=${JSON.stringify(ROOT)};
 const O=self.location.origin;
-const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
+const ckey=${ckey.toString()};
+const isSite=(h)=>ckey(h)===ROOT;
 self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
@@ -810,7 +842,7 @@ async function clientReal(id){
   if(!id)return null;
   try{
     const c=await self.clients.get(id);if(!c)return null;
-    const u=new URL(c.url);if(u.origin!==O)return null;
+    const u=new URL(c.url);if(u.origin!==O||u.pathname.indexOf(P)!==0)return null;
     const rest=u.pathname.slice(P.length);
     const m=/^(https?)\/([^\/]+)/.exec(rest);
     if(m)return{scheme:m[1],host:m[2]};
